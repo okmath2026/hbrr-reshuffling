@@ -6,13 +6,14 @@ Every file is plain JavaScript without dependencies. It runs in a browser consol
 
 | File | Reproduces |
 |---|---|
-| `hbrr_common.js` | Table 1: exact epoch complexity on common-Hessian quadratics from the mean-square formula (`commonTbar`, `commonTune`). |
-| `hbrr_screen.js` | Tables 2–5: exact mean-square moments by enumerating all permutations, the stability test, and the tuning (`HBRR.tuneRefined` for epoch counts, `HBRR.tuneRate` and `HBRR.rateExact` for rates). |
-| `hbrr_checks.js` | The separating instance (Table 6) with `hbrr_screen.js` loaded, the one-epoch checks of the general theory, and the numerical checks of the proofs in Appendix B. |
+| `hbrr_common.js` | Table 1: exact epoch complexity on common-Hessian quadratics from the mean-square formula (`commonTbar`, `commonTune`), and the misspecified-μ computations (`commonMisspec`). |
+| `hbrr_screen.js` | Tables 2–4 and 6: exact mean-square moments by enumerating all permutations, the stability test, and the tuning (`HBRR.tuneRefined` for epoch counts, `HBRR.tuneRate` and `HBRR.rateExact` for rates). |
+| `hbrr_checks.js` | The separating instance (Table 7) with `hbrr_screen.js` loaded, the one-epoch checks of the general theory, and the numerical checks of the proofs in Appendix B. |
 | `hbrr_lower.js` | The numerical checks of the heavy-ball lower bound (Theorem 4.3, Appendix C). |
-| `hbrr_mc.js` | The large-n Monte Carlo experiments (Tables 7 and 8). |
+| `hbrr_mc.js` | The large-n Monte Carlo experiments (Tables 8 and 9). |
 | `hbrr_hetero.js` | The strongly heterogeneous and correlated-offset experiments, and the switching example of Section 7. |
 | `hbrr_averaging.js` | The comparison with RR whose iterates are averaged (Section 6.6), on common-Hessian and heterogeneous instances. |
+| `hbrr_logreg.js` | The logistic-regression experiments on LIBSVM data (Section 6.7): RR, averaged RR, HBRR, NAG-RR and SAGA, single-sample and mini-batch, and the bias diagnostic (`LR.biasShare`). In a browser, `LR.runGrid` runs a grid in parallel Web Workers; the data files are read from the LIBSVM repository (australian_scale, mushrooms, a9a, w8a). |
 
 Example in Node.js:
 

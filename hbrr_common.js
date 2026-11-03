@@ -64,7 +64,18 @@
     else { best.omb = Math.sqrt(10 ** best.lr * alpha * mu); best.ratio = 10 ** best.lr; best.Tlong = tbar(method, alpha, 1 - best.omb, kappa, 4000000); }
     return best;
   }
+  // Misspecified strong convexity: the momentum is set from mu_hat = c mu by 1 - beta = sqrt(ratio alpha mu_hat), with the
+  // ratio of the tuned HBRR at c = 1, and only the step is re-tuned (1-D search as for RR).
+  function misspec(kappa, c, ratio, laMin, laMax) {
+    const mu = c / kappa; let best = { T: Infinity };
+    const f = la => { const alpha = 10 ** la, omb = Math.sqrt(ratio * alpha * mu); if (omb >= 1) return Infinity;
+      return tbar('hb', alpha, 1 - omb, kappa, best.T === Infinity ? 400000 : Math.ceil(2 * best.T) + 10); };
+    for (let i = 0; i <= 40; i++) { const la = laMin + (laMax - laMin) * i / 40, T = f(la); if (T < best.T) best = { T, la }; }
+    for (let h = 0.03; h > 0.0005; h /= 2) for (const d of [-h, h]) { const T = f(best.la + d); if (T < best.T) best = { T, la: best.la + d }; }
+    best.alpha = 10 ** best.la; best.omb = Math.sqrt(ratio * best.alpha * mu);
+    return best;
+  }
   // Table 1 used laMin/laMax = (-4.8, -2.3) for HBRR with kappa <= 1000, (-5.3, -3.3) above; (-4.8, -2.0) and (-5.3, -3.0)
   // for NAG-RR; (-3.5, -1.0) for RR (RR for kappa >= 1000 by a 1-D scan of alpha in [0.042, 0.046]).
-  Object.assign(G, { commonTbar: tbar, commonTune: tune });
+  Object.assign(G, { commonTbar: tbar, commonTune: tune, commonMisspec: misspec });
 })(typeof window !== 'undefined' ? window : globalThis);
