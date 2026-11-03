@@ -83,13 +83,15 @@
   //  'rr'   : x+ = x - a grad f_i(x)
   //  'ema'  : RR with step a, output y+ = b y + (1 - b) x+
   //  'hb'   : HBRR in averaging form with effective step a and momentum b: z+ = z - a grad f_i(x), x+ = b x + (1 - b) z+
+  //  'hbema': HBRR as 'hb', output y+ = c y + (1 - c) x+ (momentum and output averaging combined)
   //  'nag'  : x+ = y - a grad f_i(y), y+ = x+ + b (x+ - x)
   //  'saga' : SAGA with step a and uniform i.i.d. sampling, n steps per epoch
   function run(D, lam, opt, job) {
     if (job.part) return runBlocks(D, lam, opt, job);
     if (job.B > 1) return runBatch(D, lam, opt, job);
-    const { n, d } = D, a = job.a, b = job.b, r = rng(job.seed * 7919 + 13), perm = Int32Array.from({ length: n }, (_, i) => i);
+    const { n, d } = D, a = job.a, b = job.b, c = job.c, r = rng(job.seed * 7919 + 13), perm = Int32Array.from({ length: n }, (_, i) => i);
     const x = new Float64Array(d), z = new Float64Array(d), y = new Float64Array(d), tab = new Float64Array(job.method === 'saga' ? n : 0), mean = new Float64Array(d);
+    const avg = job.method === 'ema' || job.method === 'hbema';
     const out = new Float64Array(job.T), den = opt.f0 - opt.fstar;
     for (let t = 0; t < job.T; t++) {
       if (job.method !== 'saga') shuffle(perm, r);
@@ -99,11 +101,12 @@
           for (let j = 0; j < d; j++) x[j] *= 1 - a * lam;
           for (let q = D.ptr[i]; q < D.ptr[i + 1]; q++) x[D.idx[q]] -= a * s * D.val[q];
           if (job.method === 'ema') for (let j = 0; j < d; j++) y[j] = b * y[j] + (1 - b) * x[j];
-        } else if (job.method === 'hb') {
+        } else if (job.method === 'hb' || job.method === 'hbema') {
           const i = perm[k], s = coef(D, i, x);
           for (let j = 0; j < d; j++) z[j] -= a * lam * x[j];
           for (let q = D.ptr[i]; q < D.ptr[i + 1]; q++) z[D.idx[q]] -= a * s * D.val[q];
           for (let j = 0; j < d; j++) x[j] = b * x[j] + (1 - b) * z[j];
+          if (job.method === 'hbema') for (let j = 0; j < d; j++) y[j] = c * y[j] + (1 - c) * x[j];
         } else if (job.method === 'nag') { // y holds the extrapolated point
           const i = perm[k], s = coef(D, i, y);
           for (let j = 0; j < d; j++) { const xo = x[j]; x[j] = y[j] - a * lam * y[j]; z[j] = xo; }
@@ -116,7 +119,7 @@
           tab[i] = s;
         }
       }
-      const e = (value(D, lam, job.method === 'ema' ? y : x) - opt.fstar) / den;
+      const e = (value(D, lam, avg ? y : x) - opt.fstar) / den;
       out[t] = e;
       if (!(e < 1e3)) { out.fill(Infinity, t); break; }
     }
@@ -138,9 +141,10 @@
         if (job.method === 'rr') for (let j = 0; j < d; j++) x[j] -= a * g[j];
         else if (job.method === 'ema') for (let j = 0; j < d; j++) { x[j] -= a * g[j]; y[j] = b * y[j] + (1 - b) * x[j]; }
         else if (job.method === 'hb') for (let j = 0; j < d; j++) { z[j] -= a * g[j]; x[j] = b * x[j] + (1 - b) * z[j]; }
+        else if (job.method === 'hbema') for (let j = 0; j < d; j++) { z[j] -= a * g[j]; x[j] = b * x[j] + (1 - b) * z[j]; y[j] = job.c * y[j] + (1 - job.c) * x[j]; }
         else for (let j = 0; j < d; j++) { const xo = x[j]; x[j] = y[j] - a * g[j]; y[j] = x[j] + b * (x[j] - xo); }
       }
-      const e = (value(D, lam, job.method === 'ema' ? y : x) - opt.fstar) / den;
+      const e = (value(D, lam, job.method === 'ema' || job.method === 'hbema' ? y : x) - opt.fstar) / den;
       out[t] = e;
       if (!(e < 1e3)) { out.fill(Infinity, t); break; }
     }
@@ -148,12 +152,26 @@
   }
   // ---------- fixed partitions into nb blocks (components f_k = average loss of block k) ----------
   // mode 'random': random split; 'label': sorted by label (each block mostly one class);
-  // 'pca': sorted by the projection on the top principal direction of the features
+  // 'pca': sorted by the projection on the top principal direction of the features;
+  // 'attr:lo:hi': natural split by a categorical attribute, one-hot coded in features lo..hi (0-based, see onehotGroups):
+  // one block per value (samples with none of these features form one more block), nb is ignored. The blocks then have
+  // different sizes n_k, and the components are f_k = (nb n_k / n) * (average loss of block k), so that their mean is f.
+  // Equal-size modes use the block averages (weights differ from nb n_k / n only by rounding of the block sizes).
   const partCache = new WeakMap();
   function partition(D, mode, nb) {
     if (!partCache.has(D)) partCache.set(D, new Map());
     const cache = partCache.get(D), key = mode + ':' + nb; if (cache.has(key)) return cache.get(key);
     const n = D.n, r = rng(12345), ord = Int32Array.from({ length: n }, (_, i) => i); shuffle(ord, r);
+    if (mode.startsWith('attr:')) {
+      const [, a, b] = mode.split(':').map(Number), cat = new Int32Array(n).fill(b - a + 1);
+      for (let i = 0; i < n; i++) for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) if (D.idx[k] >= a && D.idx[k] <= b) cat[i] = D.idx[k] - a;
+      const cnt = new Int32Array(b - a + 2); for (let i = 0; i < n; i++) cnt[cat[i]]++;
+      const used = [...cnt.keys()].filter(v => cnt[v] > 0), o = Array.from(ord);
+      o.sort((i, j) => cat[i] - cat[j]); ord.set(o);
+      const lo = [0]; for (const v of used) lo.push(lo[lo.length - 1] + cnt[v]);
+      const P = { ord, lo: Int32Array.from(lo), nb: used.length, scale: used.length / n };
+      cache.set(key, P); return P;
+    }
     if (mode === 'label') { const o = Array.from(ord); o.sort((i, j) => D.y[i] - D.y[j]); ord.set(o); }
     if (mode === 'pca') {
       const d = D.d, mean = new Float64Array(d); let v = new Float64Array(d);
@@ -170,24 +188,41 @@
     const lo = Int32Array.from({ length: nb + 1 }, (_, k) => Math.round(k * n / nb)), P = { ord, lo };
     cache.set(key, P); return P;
   }
+  // one-hot coded categorical attributes: maximal runs [lo, hi] of consecutive 0/1 features such that no sample has two
+  // of them; returns [{ lo, hi, size, cover }] for runs of at least two features (cover: share of samples with one active)
+  function onehotGroups(D) {
+    const d = D.d - 1, bin = new Uint8Array(d).fill(1), cols = Array.from({ length: d }, () => []);
+    for (let i = 0; i < D.n; i++) for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) { const j = D.idx[k]; if (j >= d) continue; if (D.val[k] !== 1) bin[j] = 0; cols[j].push(i); }
+    const out = [], owner = new Int32Array(D.n).fill(-1);
+    let s = 0;
+    while (s < d) {
+      if (!bin[s]) { s++; continue; }
+      let e = s; for (const i of cols[s]) owner[i] = s;
+      while (e + 1 < d && bin[e + 1] && cols[e + 1].every(i => owner[i] < s)) { e++; for (const i of cols[e]) owner[i] = s; }
+      if (e > s) { let c = 0; for (let j = s; j <= e; j++) c += cols[j].length; out.push({ lo: s, hi: e, size: e - s + 1, cover: c / D.n }); }
+      s = e + 1;
+    }
+    return out;
+  }
   // RR over the nb blocks of a fixed partition (job.part, job.nb): every epoch reshuffles the order of the blocks
   function runBlocks(D, lam, opt, job) {
-    const { d } = D, a = job.a, b = job.b, nb = job.nb, { ord, lo } = partition(D, job.part, nb), r = rng(job.seed * 7919 + 13), pb = Int32Array.from({ length: nb }, (_, i) => i);
+    const { d } = D, a = job.a, b = job.b, Q = partition(D, job.part, job.nb), { ord, lo } = Q, nb = Q.nb || job.nb, r = rng(job.seed * 7919 + 13), pb = Int32Array.from({ length: nb }, (_, i) => i);
     const x = new Float64Array(d), z = new Float64Array(d), y = new Float64Array(d), g = new Float64Array(d);
     const out = new Float64Array(job.T), den = opt.f0 - opt.fstar;
     for (let t = 0; t < job.T; t++) {
       shuffle(pb, r);
       for (let k = 0; k < nb; k++) {
-        const c = pb[k], w = 1 / (lo[c + 1] - lo[c]), p = job.method === 'nag' ? y : x;
+        const c = pb[k], w = Q.scale || 1 / (lo[c + 1] - lo[c]), p = job.method === 'nag' ? y : x;
         g.fill(0);
         for (let q = lo[c]; q < lo[c + 1]; q++) { const i = ord[q], s = coef(D, i, p) * w; for (let u = D.ptr[i]; u < D.ptr[i + 1]; u++) g[D.idx[u]] += s * D.val[u]; }
         for (let j = 0; j < d; j++) g[j] += lam * p[j];
         if (job.method === 'rr') for (let j = 0; j < d; j++) x[j] -= a * g[j];
         else if (job.method === 'ema') for (let j = 0; j < d; j++) { x[j] -= a * g[j]; y[j] = b * y[j] + (1 - b) * x[j]; }
         else if (job.method === 'hb') for (let j = 0; j < d; j++) { z[j] -= a * g[j]; x[j] = b * x[j] + (1 - b) * z[j]; }
+        else if (job.method === 'hbema') for (let j = 0; j < d; j++) { z[j] -= a * g[j]; x[j] = b * x[j] + (1 - b) * z[j]; y[j] = job.c * y[j] + (1 - job.c) * x[j]; }
         else for (let j = 0; j < d; j++) { const xo = x[j]; x[j] = y[j] - a * g[j]; y[j] = x[j] + b * (x[j] - xo); }
       }
-      const e = (value(D, lam, job.method === 'ema' ? y : x) - opt.fstar) / den;
+      const e = (value(D, lam, job.method === 'ema' || job.method === 'hbema' ? y : x) - opt.fstar) / den;
       out[t] = e;
       if (!(e < 1e3)) { out.fill(Infinity, t); break; }
     }
@@ -196,13 +231,14 @@
   // bias diagnostic for block RR started at x*: share of f at the averaged iterate in the mean error (an upper bound
   // on the bias share), averaged over seeds and over the epochs after burn
   function biasShareBlocks(P, lam, part, nb, aL, E, burn, seeds) {
-    const D = P.D, d = D.d, a = aL / P.C.L, { ord, lo } = partition(D, part, nb), mean = new Float64Array(d), g = new Float64Array(d); let cnt = 0, tot = 0;
+    const D = P.D, d = D.d, a = aL / P.C.L, Q = partition(D, part, nb), { ord, lo } = Q, mean = new Float64Array(d), g = new Float64Array(d); let cnt = 0, tot = 0;
+    nb = Q.nb || nb;
     for (let sd = 1; sd <= seeds; sd++) {
       const x = Float64Array.from(P.opt.x), r = rng(sd * 7919 + 13), pb = Int32Array.from({ length: nb }, (_, i) => i);
       for (let t = 0; t < E; t++) {
         shuffle(pb, r);
         for (let k = 0; k < nb; k++) {
-          const c = pb[k], w = 1 / (lo[c + 1] - lo[c]); g.fill(0);
+          const c = pb[k], w = Q.scale || 1 / (lo[c + 1] - lo[c]); g.fill(0);
           for (let q = lo[c]; q < lo[c + 1]; q++) { const i = ord[q], s = coef(D, i, x) * w; for (let u = D.ptr[i]; u < D.ptr[i + 1]; u++) g[D.idx[u]] += s * D.val[u]; }
           for (let j = 0; j < d; j++) x[j] -= a * (g[j] + lam * x[j]);
         }
@@ -213,21 +249,23 @@
     const den = P.opt.f0 - P.opt.fstar, fb = (value(D, lam, mean) - P.opt.fstar) / den, ft = tot / cnt / den;
     return { total: ft, ofMean: fb, share: fb / ft };
   }
-  // stationary error of block RR ('rr'), averaged RR ('ema') and HBRR ('hb') started at x* with zero velocity, at
-  // effective step aL/L and memory m (1 - b = 1/m): mean of (f - f*)/(f(0) - f*) over seeds and over epochs >= burn
-  function floorBlocks(P, lam, part, nb, method, aL, m, E, burn, seeds) {
-    const D = P.D, d = D.d, a = aL / P.C.L, b = 1 - 1 / m, { ord, lo } = partition(D, part, nb), g = new Float64Array(d), den = P.opt.f0 - P.opt.fstar; let cnt = 0, tot = 0;
+  // stationary error of block RR ('rr'), averaged RR ('ema'), HBRR ('hb') and HBRR with output averaging ('hbema', output
+  // memory m2) started at x* with zero velocity, at effective step aL/L and memory m (1 - b = 1/m): mean of
+  // (f - f*)/(f(0) - f*) over seeds and over epochs >= burn
+  function floorBlocks(P, lam, part, nb, method, aL, m, E, burn, seeds, m2) {
+    const D = P.D, d = D.d, a = aL / P.C.L, b = 1 - 1 / m, c2 = 1 - 1 / (m2 || m), Q = partition(D, part, nb), { ord, lo } = Q, g = new Float64Array(d), den = P.opt.f0 - P.opt.fstar; let cnt = 0, tot = 0;
+    nb = Q.nb || nb;
     for (let sd = 1; sd <= seeds; sd++) {
       const x = Float64Array.from(P.opt.x), z = Float64Array.from(P.opt.x), y = Float64Array.from(P.opt.x), r = rng(sd * 7919 + 13), pb = Int32Array.from({ length: nb }, (_, i) => i);
       for (let t = 0; t < E; t++) {
         shuffle(pb, r);
         for (let k = 0; k < nb; k++) {
-          const c = pb[k], w = 1 / (lo[c + 1] - lo[c]); g.fill(0);
+          const c = pb[k], w = Q.scale || 1 / (lo[c + 1] - lo[c]); g.fill(0);
           for (let q = lo[c]; q < lo[c + 1]; q++) { const i = ord[q], s = coef(D, i, x) * w; for (let u = D.ptr[i]; u < D.ptr[i + 1]; u++) g[D.idx[u]] += s * D.val[u]; }
-          if (method === 'hb') for (let j = 0; j < d; j++) { z[j] -= a * (g[j] + lam * x[j]); x[j] = b * x[j] + (1 - b) * z[j]; }
+          if (method === 'hb' || method === 'hbema') for (let j = 0; j < d; j++) { z[j] -= a * (g[j] + lam * x[j]); x[j] = b * x[j] + (1 - b) * z[j]; if (method === 'hbema') y[j] = c2 * y[j] + (1 - c2) * x[j]; }
           else for (let j = 0; j < d; j++) { x[j] -= a * (g[j] + lam * x[j]); if (method === 'ema') y[j] = b * y[j] + (1 - b) * x[j]; }
         }
-        if (t >= burn) { tot += (value(D, lam, method === 'ema' ? y : x) - P.opt.fstar) / den; cnt++; }
+        if (t >= burn) { tot += (value(D, lam, method === 'ema' || method === 'hbema' ? y : x) - P.opt.fstar) / den; cnt++; }
       }
     }
     return tot / cnt;
@@ -261,6 +299,23 @@
     for (const a of pw(-8, 5)) for (const m of mem) jobs.push({ method: 'nag', a: a / m, b: 1 - 1 / m, m, g: a, B });
     return jobs;
   }
+  // two-stage tuning of Section 6.9 (Table 10). Stage one: the 'rr', 'ema' and 'hb' jobs of grids() (single samples) or
+  // gridsBlocks() (blocks) with seed 1, summarized by atBudget. Stage two: the jobs below, run with the final seeds
+  // (1..5 for single samples, 1..3 for blocks). n is the number of steps per epoch; extra holds { part, nb } for blocks.
+  //  - RR, averaged RR and HBRR around their stage-one optima: steps x 1/2, 1, 2 and memories x 1/3, 1, 3;
+  //  - HBRR with averaged iterates around the HBRR optimum: the same steps and memories, output memories n, 10 n, 100 n;
+  //  - and around the averaged-RR optimum: its steps x 1/2, 1, 2, momentum memories n/10, n/3, n, output memory x 1/3, 1, 3.
+  function gridsCombined(best, extra, n) {
+    const J = [], ok = m => m >= 1.5;
+    for (const meth of ['rr', 'ema', 'hb']) {
+      const B = best[meth]; if (!B) continue;
+      for (const fa of [0.5, 1, 2]) for (const fm of meth === 'rr' ? [1] : [1 / 3, 1, 3]) { const m = B.m * fm; J.push({ method: meth, a: B.a * fa, b: meth === 'rr' ? 0 : 1 - 1 / m, m, ...extra }); }
+    }
+    const H = best.hb, E = best.ema;
+    for (const fa of [0.5, 1, 2]) for (const fm of [1 / 3, 1, 3]) for (const m2 of [n, 10 * n, 100 * n]) { const m = H.m * fm; J.push({ method: 'hbema', a: H.a * fa, b: 1 - 1 / m, m, c: 1 - 1 / m2, m2, ...extra }); }
+    for (const fa of [0.5, 1, 2]) for (const m of [n / 10, n / 3, n].filter(ok)) for (const fm of [1 / 3, 1, 3]) { const m2 = E.m * fm; if (ok(m2)) J.push({ method: 'hbema', a: E.a * fa, b: 1 - 1 / m, m, c: 1 - 1 / m2, m2, ...extra }); }
+    return J;
+  }
   // grid for RR over the nb blocks of a fixed partition; memories relative to nb
   function gridsBlocks(part, nb, L) {
     const pw = (lo, hi) => { const v = []; for (let k = lo; k <= hi; k++) v.push(2 ** k / L); return v; };
@@ -285,7 +340,7 @@
   // tuned median error after B epochs, per method
   function atBudget(results, B) {
     const best = {};
-    for (const R of results) { const v = median(R.err.map(e => e[B - 1])), j = R.job; if (!best[j.method] || v < best[j.method].err) best[j.method] = { err: v, a: j.g || j.a, m: j.m }; }
+    for (const R of results) { const v = median(R.err.map(e => e[B - 1])), j = R.job; if (!best[j.method] || v < best[j.method].err) best[j.method] = { err: v, a: j.g || j.a, m: j.m, m2: j.m2 }; }
     return best;
   }
 
@@ -331,7 +386,7 @@
     }))).then(() => R);
   }
 
-  const API = { parseLibsvm, value, constants, hessTop, newton, run, hit, median, grids, gridsBatch, gridsBlocks, summarize, atBudget, biasShare, partition, biasShareBlocks, floorBlocks, prepare, runGrid, runJobs };
+  const API = { parseLibsvm, value, constants, hessTop, newton, run, hit, median, grids, gridsBatch, gridsBlocks, gridsCombined, summarize, atBudget, biasShare, partition, onehotGroups, biasShareBlocks, floorBlocks, prepare, runGrid, runJobs };
   G.LR = API;
   // Web Worker protocol: {cmd: 'init', D, lam, opt} then {cmd: 'run', jobs}; posts {i, err} per run
   if (typeof WorkerGlobalScope !== 'undefined' && G instanceof WorkerGlobalScope) {
