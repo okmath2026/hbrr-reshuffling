@@ -12,6 +12,7 @@ Every file is plain JavaScript without dependencies. It runs in a browser consol
 | `hbrr_lower.js` | The numerical checks of the heavy-ball lower bound (Theorem 4.3, Appendix C). |
 | `hbrr_mc.js` | The large-n Monte Carlo experiments (Tables 7 and 8). |
 | `hbrr_hetero.js` | The strongly heterogeneous and correlated-offset experiments, and the switching example of Section 7. |
+| `hbrr_averaging.js` | The comparison with RR whose iterates are averaged (Section 6.6), on common-Hessian and heterogeneous instances. |
 
 Example in Node.js:
 
