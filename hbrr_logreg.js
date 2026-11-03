@@ -38,6 +38,17 @@
     let mx = 0; for (let i = 0; i < D.n; i++) { let s = 0; for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) s += D.val[k] * D.val[k]; mx = Math.max(mx, s); }
     return { L: ev / (4 * D.n) + lam, Lmax: mx / 4 + lam, mu: lam };
   }
+  // largest eigenvalue of the Hessian at x (power iteration); with lam it gives the local condition number at x*
+  function hessTop(D, lam, x) {
+    const w = new Float64Array(D.n); for (let i = 0; i < D.n; i++) { const p = 1 / (1 + Math.exp(margin(D, i, x))); w[i] = p * (1 - p); }
+    let v = new Float64Array(D.d).fill(1), ev = 0;
+    for (let it = 0; it < 300; it++) {
+      const u = new Float64Array(D.d);
+      for (let i = 0; i < D.n; i++) { let s = 0; for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) s += D.val[k] * v[D.idx[k]]; for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) u[D.idx[k]] += w[i] * s * D.val[k] / D.n; }
+      let nr = 0; for (let j = 0; j < D.d; j++) { u[j] += lam * v[j]; nr += u[j] * u[j]; } nr = Math.sqrt(nr); ev = nr; for (let j = 0; j < D.d; j++) v[j] = u[j] / nr;
+    }
+    return ev;
+  }
   // damped Newton with a dense Cholesky solve (d is at most a few hundred)
   function newton(D, lam) {
     const d = D.d, x = new Float64Array(d); let f = value(D, lam, x);
@@ -75,6 +86,7 @@
   //  'nag'  : x+ = y - a grad f_i(y), y+ = x+ + b (x+ - x)
   //  'saga' : SAGA with step a and uniform i.i.d. sampling, n steps per epoch
   function run(D, lam, opt, job) {
+    if (job.part) return runBlocks(D, lam, opt, job);
     if (job.B > 1) return runBatch(D, lam, opt, job);
     const { n, d } = D, a = job.a, b = job.b, r = rng(job.seed * 7919 + 13), perm = Int32Array.from({ length: n }, (_, i) => i);
     const x = new Float64Array(d), z = new Float64Array(d), y = new Float64Array(d), tab = new Float64Array(job.method === 'saga' ? n : 0), mean = new Float64Array(d);
@@ -134,6 +146,92 @@
     }
     return out;
   }
+  // ---------- fixed partitions into nb blocks (components f_k = average loss of block k) ----------
+  // mode 'random': random split; 'label': sorted by label (each block mostly one class);
+  // 'pca': sorted by the projection on the top principal direction of the features
+  const partCache = new WeakMap();
+  function partition(D, mode, nb) {
+    if (!partCache.has(D)) partCache.set(D, new Map());
+    const cache = partCache.get(D), key = mode + ':' + nb; if (cache.has(key)) return cache.get(key);
+    const n = D.n, r = rng(12345), ord = Int32Array.from({ length: n }, (_, i) => i); shuffle(ord, r);
+    if (mode === 'label') { const o = Array.from(ord); o.sort((i, j) => D.y[i] - D.y[j]); ord.set(o); }
+    if (mode === 'pca') {
+      const d = D.d, mean = new Float64Array(d); let v = new Float64Array(d);
+      for (let i = 0; i < n; i++) for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) mean[D.idx[k]] += D.val[k] / n;
+      for (let j = 0; j < d; j++) v[j] = Math.sin(j + 1);
+      for (let it = 0; it < 200; it++) {
+        const w = new Float64Array(d); let mv = 0; for (let j = 0; j < d; j++) mv += mean[j] * v[j];
+        for (let i = 0; i < n; i++) { let s = 0; for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) s += D.val[k] * v[D.idx[k]]; for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) w[D.idx[k]] += s * D.val[k] / n; }
+        let nr = 0; for (let j = 0; j < d; j++) { w[j] -= mean[j] * mv; nr += w[j] * w[j]; } nr = Math.sqrt(nr); for (let j = 0; j < d; j++) v[j] = w[j] / nr;
+      }
+      const proj = new Float64Array(n); for (let i = 0; i < n; i++) { let s = 0; for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) s += D.val[k] * v[D.idx[k]]; proj[i] = s; }
+      const o = Array.from(ord); o.sort((i, j) => proj[i] - proj[j]); ord.set(o);
+    }
+    const lo = Int32Array.from({ length: nb + 1 }, (_, k) => Math.round(k * n / nb)), P = { ord, lo };
+    cache.set(key, P); return P;
+  }
+  // RR over the nb blocks of a fixed partition (job.part, job.nb): every epoch reshuffles the order of the blocks
+  function runBlocks(D, lam, opt, job) {
+    const { d } = D, a = job.a, b = job.b, nb = job.nb, { ord, lo } = partition(D, job.part, nb), r = rng(job.seed * 7919 + 13), pb = Int32Array.from({ length: nb }, (_, i) => i);
+    const x = new Float64Array(d), z = new Float64Array(d), y = new Float64Array(d), g = new Float64Array(d);
+    const out = new Float64Array(job.T), den = opt.f0 - opt.fstar;
+    for (let t = 0; t < job.T; t++) {
+      shuffle(pb, r);
+      for (let k = 0; k < nb; k++) {
+        const c = pb[k], w = 1 / (lo[c + 1] - lo[c]), p = job.method === 'nag' ? y : x;
+        g.fill(0);
+        for (let q = lo[c]; q < lo[c + 1]; q++) { const i = ord[q], s = coef(D, i, p) * w; for (let u = D.ptr[i]; u < D.ptr[i + 1]; u++) g[D.idx[u]] += s * D.val[u]; }
+        for (let j = 0; j < d; j++) g[j] += lam * p[j];
+        if (job.method === 'rr') for (let j = 0; j < d; j++) x[j] -= a * g[j];
+        else if (job.method === 'ema') for (let j = 0; j < d; j++) { x[j] -= a * g[j]; y[j] = b * y[j] + (1 - b) * x[j]; }
+        else if (job.method === 'hb') for (let j = 0; j < d; j++) { z[j] -= a * g[j]; x[j] = b * x[j] + (1 - b) * z[j]; }
+        else for (let j = 0; j < d; j++) { const xo = x[j]; x[j] = y[j] - a * g[j]; y[j] = x[j] + b * (x[j] - xo); }
+      }
+      const e = (value(D, lam, job.method === 'ema' ? y : x) - opt.fstar) / den;
+      out[t] = e;
+      if (!(e < 1e3)) { out.fill(Infinity, t); break; }
+    }
+    return out;
+  }
+  // bias diagnostic for block RR started at x*: share of f at the averaged iterate in the mean error (an upper bound
+  // on the bias share), averaged over seeds and over the epochs after burn
+  function biasShareBlocks(P, lam, part, nb, aL, E, burn, seeds) {
+    const D = P.D, d = D.d, a = aL / P.C.L, { ord, lo } = partition(D, part, nb), mean = new Float64Array(d), g = new Float64Array(d); let cnt = 0, tot = 0;
+    for (let sd = 1; sd <= seeds; sd++) {
+      const x = Float64Array.from(P.opt.x), r = rng(sd * 7919 + 13), pb = Int32Array.from({ length: nb }, (_, i) => i);
+      for (let t = 0; t < E; t++) {
+        shuffle(pb, r);
+        for (let k = 0; k < nb; k++) {
+          const c = pb[k], w = 1 / (lo[c + 1] - lo[c]); g.fill(0);
+          for (let q = lo[c]; q < lo[c + 1]; q++) { const i = ord[q], s = coef(D, i, x) * w; for (let u = D.ptr[i]; u < D.ptr[i + 1]; u++) g[D.idx[u]] += s * D.val[u]; }
+          for (let j = 0; j < d; j++) x[j] -= a * (g[j] + lam * x[j]);
+        }
+        if (t >= burn) { for (let j = 0; j < d; j++) mean[j] += x[j]; tot += value(D, lam, x) - P.opt.fstar; cnt++; }
+      }
+    }
+    for (let j = 0; j < d; j++) mean[j] /= cnt;
+    const den = P.opt.f0 - P.opt.fstar, fb = (value(D, lam, mean) - P.opt.fstar) / den, ft = tot / cnt / den;
+    return { total: ft, ofMean: fb, share: fb / ft };
+  }
+  // stationary error of block RR ('rr'), averaged RR ('ema') and HBRR ('hb') started at x* with zero velocity, at
+  // effective step aL/L and memory m (1 - b = 1/m): mean of (f - f*)/(f(0) - f*) over seeds and over epochs >= burn
+  function floorBlocks(P, lam, part, nb, method, aL, m, E, burn, seeds) {
+    const D = P.D, d = D.d, a = aL / P.C.L, b = 1 - 1 / m, { ord, lo } = partition(D, part, nb), g = new Float64Array(d), den = P.opt.f0 - P.opt.fstar; let cnt = 0, tot = 0;
+    for (let sd = 1; sd <= seeds; sd++) {
+      const x = Float64Array.from(P.opt.x), z = Float64Array.from(P.opt.x), y = Float64Array.from(P.opt.x), r = rng(sd * 7919 + 13), pb = Int32Array.from({ length: nb }, (_, i) => i);
+      for (let t = 0; t < E; t++) {
+        shuffle(pb, r);
+        for (let k = 0; k < nb; k++) {
+          const c = pb[k], w = 1 / (lo[c + 1] - lo[c]); g.fill(0);
+          for (let q = lo[c]; q < lo[c + 1]; q++) { const i = ord[q], s = coef(D, i, x) * w; for (let u = D.ptr[i]; u < D.ptr[i + 1]; u++) g[D.idx[u]] += s * D.val[u]; }
+          if (method === 'hb') for (let j = 0; j < d; j++) { z[j] -= a * (g[j] + lam * x[j]); x[j] = b * x[j] + (1 - b) * z[j]; }
+          else for (let j = 0; j < d; j++) { x[j] -= a * (g[j] + lam * x[j]); if (method === 'ema') y[j] = b * y[j] + (1 - b) * x[j]; }
+        }
+        if (t >= burn) { tot += (value(D, lam, method === 'ema' ? y : x) - P.opt.fstar) / den; cnt++; }
+      }
+    }
+    return tot / cnt;
+  }
   // first epoch from which the error stays at most eps up to the budget, or Infinity
   function hit(err, eps) { let t = err.length; while (t > 0 && err[t - 1] <= eps) t--; return t < err.length ? t + 1 : Infinity; }
   const median = v => { const s = [...v].sort((p, q) => p - q); return s[(s.length - 1) >> 1]; };
@@ -160,6 +258,18 @@
     for (const a of pw(-8, 5)) jobs.push({ method: 'rr', a, b: 0, m: 0, B });
     for (const a of pw(-8, 5)) for (const m of mem) jobs.push({ method: 'ema', a, b: 1 - 1 / m, m, B });
     for (const a of pw(-8, 5)) for (const m of mem) jobs.push({ method: 'hb', a, b: 1 - 1 / m, m, B });
+    for (const a of pw(-8, 5)) for (const m of mem) jobs.push({ method: 'nag', a: a / m, b: 1 - 1 / m, m, g: a, B });
+    return jobs;
+  }
+  // grid for RR over the nb blocks of a fixed partition; memories relative to nb
+  function gridsBlocks(part, nb, L) {
+    const pw = (lo, hi) => { const v = []; for (let k = lo; k <= hi; k++) v.push(2 ** k / L); return v; };
+    const mem = [nb / 3, nb, 3 * nb, 10 * nb, 30 * nb, 100 * nb, 300 * nb, 1000 * nb, 3000 * nb].filter(m => m >= 1.5);
+    const jobs = [];
+    for (const a of pw(-8, 2)) jobs.push({ method: 'rr', a, b: 0, m: 0, part, nb });
+    for (const a of pw(-8, 2)) for (const m of mem) jobs.push({ method: 'ema', a, b: 1 - 1 / m, m, part, nb });
+    for (const a of pw(-8, 2)) for (const m of mem) jobs.push({ method: 'hb', a, b: 1 - 1 / m, m, part, nb });
+    for (const a of pw(-8, 2)) for (const m of mem) jobs.push({ method: 'nag', a: a / m, b: 1 - 1 / m, m, g: a, part, nb });
     return jobs;
   }
   // results: [{ job, err: [per seed] }]; best median epochs to eps per method, and per (method, memory)
@@ -203,8 +313,14 @@
   // data set text -> { D, C, opt }
   function prepare(text, lam) { const D = parseLibsvm(text); return { D, C: constants(D, lam), opt: newton(D, lam) }; }
   // runs the whole grid for one data set in nw Web Workers created from src, the source text of this file
+  // B: mini-batch size, or { part, nb } for a fixed partition into blocks
   function runGrid(src, P, lam, T, seeds, nw, prog, B) {
-    const grid = B > 1 ? gridsBatch(P.D.n, B, P.C.L) : grids(P.D.n, P.C.L, P.C.Lmax, P.C.mu), R = grid.map(job => ({ job, err: [] })), queue = [];
+    return runJobs(src, P, lam, B && B.part ? gridsBlocks(B.part, B.nb, P.C.L) : B > 1 ? gridsBatch(P.D.n, B, P.C.L) : grids(P.D.n, P.C.L, P.C.Lmax, P.C.mu), T, seeds, nw, prog);
+  }
+  // runs an explicit list of jobs (the local re-tuning of Section 6.7 uses the best grid point of each method and its
+  // neighbours: steps times 1/2, 1, 2 and memories times 1/3, 1, 3)
+  function runJobs(src, P, lam, grid, T, seeds, nw, prog) {
+    const R = grid.map(job => ({ job, err: [] })), queue = [];
     grid.forEach((job, gi) => seeds.forEach((s, si) => queue.push({ ...job, seed: s, T, i: gi * 16 + si })));
     prog.total = queue.length; prog.done = 0;
     const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
@@ -215,7 +331,7 @@
     }))).then(() => R);
   }
 
-  const API = { parseLibsvm, value, constants, newton, run, hit, median, grids, gridsBatch, summarize, atBudget, biasShare, prepare, runGrid };
+  const API = { parseLibsvm, value, constants, hessTop, newton, run, hit, median, grids, gridsBatch, gridsBlocks, summarize, atBudget, biasShare, partition, biasShareBlocks, floorBlocks, prepare, runGrid, runJobs };
   G.LR = API;
   // Web Worker protocol: {cmd: 'init', D, lam, opt} then {cmd: 'run', jobs}; posts {i, err} per run
   if (typeof WorkerGlobalScope !== 'undefined' && G instanceof WorkerGlobalScope) {
