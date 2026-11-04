@@ -245,6 +245,27 @@
     }
     return out;
   }
-  Object.assign(G, { avgTbarCommon: tbarCommon, avgTuneCommon: tuneCommonEMA, avgTuneCommonHBEMA: tuneCommonHBEMA, avgMakeInstance: makeInstance, avgMapsEMA: mapsEMA, avgMapsHB: mapsHB,
+  // HBRR with averaged iterates with the parameters set by the rule of Section 6.9 from muHat = fac * mu:
+  // (1 - beta)^2 = r alpha muHat and 1 - c = q (1 - beta), r = 2.5, q = 0.6; only alpha is searched (41-point grid of
+  // log10 alpha in [uMin, uMax], then a 1-D pattern search). Common Hessian: instance of Table 1, mu = 1 / kappa.
+  function ruleCommon(kappa, fac, uMin, uMax, r = 2.5, q = 0.6) {
+    const muHat = fac / kappa; let best = { T: Infinity };
+    const f = u => { const a = 10 ** u, omb = Math.sqrt(r * a * muHat); if (omb >= 1) return Infinity;
+      return tbarCommon('hbema', a, 1 - omb, kappa, best.T === Infinity ? 600000 : Math.ceil(1.5 * best.T) + 10, 1 - q * omb); };
+    for (let i = 0; i <= 40; i++) { const u = uMin + (uMax - uMin) * i / 40, T = f(u); if (T < best.T) best = { T, u }; }
+    for (let h = 0.05; h > 0.001; h /= 2) { let mv = true; while (mv) { mv = false; for (const d of [-h, h]) { const T = f(best.u + d); if (T < best.T) { best = { T, u: best.u + d }; mv = true; } } } }
+    best.alpha = 10 ** best.u; return best;
+  }
+  // the same rule on a heterogeneous instance (mu = 1 / kappa of the instance), started from the given values of log10 alpha
+  function ruleHet(n, kappaTarget, seed, fac, starts, eps, cap, r = 2.5, q = 0.6) {
+    const I = makeInstance(n, kappaTarget, seed), muHat = fac / I.kappa, e = eps * I.E0, cache = new Map(); let best = Infinity;
+    const f = u => { const k = u.toFixed(4); if (cache.has(k)) return cache.get(k); const a = 10 ** u, omb = Math.sqrt(r * a * muHat); let T = Infinity;
+      if (omb < 1) { const mm = mapsHBEMA(I, a, 1 - omb, 1 - q * omb); T = tbar(I, moments(mm.Ms, mm.cs, n), e, best === Infinity ? cap : Math.min(cap, Math.ceil(4.5 * best) + 2010), 4); }
+      if (T < best) best = T; cache.set(k, T); return T; };
+    let gb = { T: Infinity };
+    for (const s of starts) { let u = s, bv = f(u); for (let h = 0.2; h > 0.004; h /= 2) { let mv = true; while (mv) { mv = false; for (const d of [-h, h]) { const T = f(u + d); if (T < bv) { bv = T; u += d; mv = true; } } } } if (bv < gb.T) gb = { T: bv, u }; }
+    return { n, kappa: I.kappa, fac, T: gb.T, alpha: 10 ** gb.u };
+  }
+  Object.assign(G, { avgRuleCommon: ruleCommon, avgRuleHet: ruleHet, avgTbarCommon: tbarCommon, avgTuneCommon: tuneCommonEMA, avgTuneCommonHBEMA: tuneCommonHBEMA, avgMakeInstance: makeInstance, avgMapsEMA: mapsEMA, avgMapsHB: mapsHB,
     avgMapsHBEMA: mapsHBEMA, avgMoments: moments, avgErrInf: errInf, avgTbar: tbar, avgTuneHet: tuneHet, avgFloorStudy: floorStudy, avgFloorStudyCombined: floorStudyCombined });
 })(typeof window !== 'undefined' ? window : globalThis);

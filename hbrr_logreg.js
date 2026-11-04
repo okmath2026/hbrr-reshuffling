@@ -206,27 +206,33 @@
     return out;
   }
   // RR over the nb blocks of a fixed partition (job.part, job.nb): every epoch reshuffles the order of the blocks;
-  // 'saga' samples the blocks i.i.d. (nb steps per epoch) and stores one gradient per block
+  // 'saga' samples the blocks i.i.d. (nb steps per epoch) and stores one gradient per block;
+  // 'rrx' is Richardson-Romberg extrapolation: RR with steps a and 2a on the same permutations (x and z), both averaged
+  // with weight b (b = 0: no averaging), output 2 y - y2; it costs two gradients per step
   function runBlocks(D, lam, opt, job) {
     const { d } = D, a = job.a, b = job.b, Q = partition(D, job.part, job.nb), { ord, lo } = Q, nb = Q.nb || job.nb, r = rng(job.seed * 7919 + 13), pb = Int32Array.from({ length: nb }, (_, i) => i);
     const x = new Float64Array(d), z = new Float64Array(d), y = new Float64Array(d), g = new Float64Array(d);
     const saga = job.method === 'saga', tab = new Float64Array(saga ? nb * d : 0), mean = new Float64Array(d);
+    const rrx = job.method === 'rrx', y2 = new Float64Array(rrx ? d : 0), g2 = new Float64Array(rrx ? d : 0), o = new Float64Array(rrx ? d : 0);
+    const grad = (p, c, w, gb) => { gb.fill(0);
+      for (let q = lo[c]; q < lo[c + 1]; q++) { const i = ord[q], s = coef(D, i, p) * w; for (let u = D.ptr[i]; u < D.ptr[i + 1]; u++) gb[D.idx[u]] += s * D.val[u]; }
+      for (let j = 0; j < d; j++) gb[j] += lam * p[j]; };
     const out = new Float64Array(job.T), den = opt.f0 - opt.fstar;
     for (let t = 0; t < job.T; t++) {
       shuffle(pb, r);
       for (let k = 0; k < nb; k++) {
         const c = saga ? Math.floor(r() * nb) : pb[k], w = Q.scale || 1 / (lo[c + 1] - lo[c]), p = job.method === 'nag' ? y : x;
-        g.fill(0);
-        for (let q = lo[c]; q < lo[c + 1]; q++) { const i = ord[q], s = coef(D, i, p) * w; for (let u = D.ptr[i]; u < D.ptr[i + 1]; u++) g[D.idx[u]] += s * D.val[u]; }
-        for (let j = 0; j < d; j++) g[j] += lam * p[j];
-        if (job.method === 'rr') for (let j = 0; j < d; j++) x[j] -= a * g[j];
+        grad(p, c, w, g);
+        if (rrx) { grad(z, c, w, g2); for (let j = 0; j < d; j++) { x[j] -= a * g[j]; z[j] -= 2 * a * g2[j]; y[j] = b * y[j] + (1 - b) * x[j]; y2[j] = b * y2[j] + (1 - b) * z[j]; } }
+        else if (job.method === 'rr') for (let j = 0; j < d; j++) x[j] -= a * g[j];
         else if (job.method === 'ema') for (let j = 0; j < d; j++) { x[j] -= a * g[j]; y[j] = b * y[j] + (1 - b) * x[j]; }
         else if (job.method === 'hb') for (let j = 0; j < d; j++) { z[j] -= a * g[j]; x[j] = b * x[j] + (1 - b) * z[j]; }
         else if (job.method === 'hbema') for (let j = 0; j < d; j++) { z[j] -= a * g[j]; x[j] = b * x[j] + (1 - b) * z[j]; y[j] = job.c * y[j] + (1 - job.c) * x[j]; }
         else if (saga) for (let j = 0; j < d; j++) { const dg = g[j] - tab[c * d + j]; x[j] -= a * (dg + mean[j]); mean[j] += dg / nb; tab[c * d + j] = g[j]; }
         else for (let j = 0; j < d; j++) { const xo = x[j]; x[j] = y[j] - a * g[j]; y[j] = x[j] + b * (x[j] - xo); }
       }
-      const e = (value(D, lam, job.method === 'ema' || job.method === 'hbema' ? y : x) - opt.fstar) / den;
+      if (rrx) for (let j = 0; j < d; j++) o[j] = 2 * y[j] - y2[j];
+      const e = (value(D, lam, rrx ? o : job.method === 'ema' || job.method === 'hbema' ? y : x) - opt.fstar) / den;
       out[t] = e;
       if (!(e < 1e3)) { out.fill(Infinity, t); break; }
     }
@@ -236,6 +242,28 @@
   function gridsSagaBlocks(part, nb, L) {
     const jobs = []; for (let k = -10; k <= 2; k++) jobs.push({ method: 'saga', a: 2 ** k / L, b: 0, m: 0, part, nb });
     return jobs;
+  }
+  // Richardson-Romberg extrapolation over the blocks: steps 2^k / L, k = -8..1 (the second run uses 2a), without
+  // averaging (m = 0) or with the averaging memories of gridsBlocks
+  function gridsRRXBlocks(part, nb, L) {
+    const mem = [0, nb / 3, nb, 3 * nb, 10 * nb, 30 * nb, 100 * nb, 300 * nb, 1000 * nb, 3000 * nb].filter(m => m === 0 || m >= 1.5), jobs = [];
+    for (let k = -8; k <= 1; k++) for (const m of mem) jobs.push({ method: 'rrx', a: 2 ** k / L, b: m ? 1 - 1 / m : 0, m, part, nb });
+    return jobs;
+  }
+  // local re-tuning around a stage-one optimum B = { a, m } (as gridsCombined): steps x 1/2, 1, 2, memories x 1/3, 1, 3
+  function gridsLocal(method, B, extra) {
+    const J = [];
+    for (const fa of [0.5, 1, 2]) for (const fm of B.m ? [1 / 3, 1, 3] : [1]) { const m = B.m * fm; if (m && m < 1.5) continue; J.push({ method, a: B.a * fa, b: m ? 1 - 1 / m : 0, m, ...extra }); }
+    return J;
+  }
+  // HBRR with averaged iterates and parameters set by the rule of Section 6.9 from an estimate muHat of mu:
+  // 1 - beta = r gamma muHat and 1 - c = q (1 - beta), with r = 2.5 and q = 0.6; only the effective step gamma = 2^k / L,
+  // k = kLo..kHi, is searched (memories are capped at 1, i.e. beta >= 0)
+  function gridsRule(L, muHat, kLo, kHi, extra, r = 2.5, q = 0.6) {
+    const J = [];
+    for (let k = kLo; k <= kHi; k++) { const a = 2 ** k / L, omb = Math.min(1, r * a * muHat), m = 1 / omb, m2 = 1 / (q * omb);
+      J.push({ method: 'hbema', a, b: 1 - omb, m, c: 1 - q * omb, m2, ...extra }); }
+    return J;
   }
   // bias diagnostic for block RR started at x*: share of f at the averaged iterate in the mean error (an upper bound
   // on the bias share), averaged over seeds and over the epochs after burn
@@ -395,7 +423,7 @@
     }))).then(() => R);
   }
 
-  const API = { parseLibsvm, value, constants, hessTop, newton, run, hit, median, grids, gridsBatch, gridsBlocks, gridsSagaBlocks, gridsCombined, summarize, atBudget, biasShare, partition, onehotGroups, biasShareBlocks, floorBlocks, prepare, runGrid, runJobs };
+  const API = { parseLibsvm, value, constants, hessTop, newton, run, hit, median, grids, gridsBatch, gridsBlocks, gridsSagaBlocks, gridsRRXBlocks, gridsLocal, gridsRule, gridsCombined, summarize, atBudget, biasShare, partition, onehotGroups, biasShareBlocks, floorBlocks, prepare, runGrid, runJobs };
   G.LR = API;
   // Web Worker protocol: {cmd: 'init', D, lam, opt} then {cmd: 'run', jobs}; posts {i, err} per run
   if (typeof WorkerGlobalScope !== 'undefined' && G instanceof WorkerGlobalScope) {
