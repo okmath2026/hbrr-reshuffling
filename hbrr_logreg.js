@@ -204,15 +204,17 @@
     }
     return out;
   }
-  // RR over the nb blocks of a fixed partition (job.part, job.nb): every epoch reshuffles the order of the blocks
+  // RR over the nb blocks of a fixed partition (job.part, job.nb): every epoch reshuffles the order of the blocks;
+  // 'saga' samples the blocks i.i.d. (nb steps per epoch) and stores one gradient per block
   function runBlocks(D, lam, opt, job) {
     const { d } = D, a = job.a, b = job.b, Q = partition(D, job.part, job.nb), { ord, lo } = Q, nb = Q.nb || job.nb, r = rng(job.seed * 7919 + 13), pb = Int32Array.from({ length: nb }, (_, i) => i);
     const x = new Float64Array(d), z = new Float64Array(d), y = new Float64Array(d), g = new Float64Array(d);
+    const saga = job.method === 'saga', tab = new Float64Array(saga ? nb * d : 0), mean = new Float64Array(d);
     const out = new Float64Array(job.T), den = opt.f0 - opt.fstar;
     for (let t = 0; t < job.T; t++) {
       shuffle(pb, r);
       for (let k = 0; k < nb; k++) {
-        const c = pb[k], w = Q.scale || 1 / (lo[c + 1] - lo[c]), p = job.method === 'nag' ? y : x;
+        const c = saga ? Math.floor(r() * nb) : pb[k], w = Q.scale || 1 / (lo[c + 1] - lo[c]), p = job.method === 'nag' ? y : x;
         g.fill(0);
         for (let q = lo[c]; q < lo[c + 1]; q++) { const i = ord[q], s = coef(D, i, p) * w; for (let u = D.ptr[i]; u < D.ptr[i + 1]; u++) g[D.idx[u]] += s * D.val[u]; }
         for (let j = 0; j < d; j++) g[j] += lam * p[j];
@@ -220,6 +222,7 @@
         else if (job.method === 'ema') for (let j = 0; j < d; j++) { x[j] -= a * g[j]; y[j] = b * y[j] + (1 - b) * x[j]; }
         else if (job.method === 'hb') for (let j = 0; j < d; j++) { z[j] -= a * g[j]; x[j] = b * x[j] + (1 - b) * z[j]; }
         else if (job.method === 'hbema') for (let j = 0; j < d; j++) { z[j] -= a * g[j]; x[j] = b * x[j] + (1 - b) * z[j]; y[j] = job.c * y[j] + (1 - job.c) * x[j]; }
+        else if (saga) for (let j = 0; j < d; j++) { const dg = g[j] - tab[c * d + j]; x[j] -= a * (dg + mean[j]); mean[j] += dg / nb; tab[c * d + j] = g[j]; }
         else for (let j = 0; j < d; j++) { const xo = x[j]; x[j] = y[j] - a * g[j]; y[j] = x[j] + b * (x[j] - xo); }
       }
       const e = (value(D, lam, job.method === 'ema' || job.method === 'hbema' ? y : x) - opt.fstar) / den;
@@ -227,6 +230,11 @@
       if (!(e < 1e3)) { out.fill(Infinity, t); break; }
     }
     return out;
+  }
+  // SAGA over the blocks of a fixed partition: steps 2^k / L, k = -10..2
+  function gridsSagaBlocks(part, nb, L) {
+    const jobs = []; for (let k = -10; k <= 2; k++) jobs.push({ method: 'saga', a: 2 ** k / L, b: 0, m: 0, part, nb });
+    return jobs;
   }
   // bias diagnostic for block RR started at x*: share of f at the averaged iterate in the mean error (an upper bound
   // on the bias share), averaged over seeds and over the epochs after burn
@@ -299,7 +307,7 @@
     for (const a of pw(-8, 5)) for (const m of mem) jobs.push({ method: 'nag', a: a / m, b: 1 - 1 / m, m, g: a, B });
     return jobs;
   }
-  // two-stage tuning of Section 6.9 (Table 10). Stage one: the 'rr', 'ema' and 'hb' jobs of grids() (single samples) or
+  // two-stage tuning of Section 6.9 (Table 11). Stage one: the 'rr', 'ema' and 'hb' jobs of grids() (single samples) or
   // gridsBlocks() (blocks) with seed 1, summarized by atBudget. Stage two: the jobs below, run with the final seeds
   // (1..5 for single samples, 1..3 for blocks). n is the number of steps per epoch; extra holds { part, nb } for blocks.
   //  - RR, averaged RR and HBRR around their stage-one optima: steps x 1/2, 1, 2 and memories x 1/3, 1, 3;
@@ -386,7 +394,7 @@
     }))).then(() => R);
   }
 
-  const API = { parseLibsvm, value, constants, hessTop, newton, run, hit, median, grids, gridsBatch, gridsBlocks, gridsCombined, summarize, atBudget, biasShare, partition, onehotGroups, biasShareBlocks, floorBlocks, prepare, runGrid, runJobs };
+  const API = { parseLibsvm, value, constants, hessTop, newton, run, hit, median, grids, gridsBatch, gridsBlocks, gridsSagaBlocks, gridsCombined, summarize, atBudget, biasShare, partition, onehotGroups, biasShareBlocks, floorBlocks, prepare, runGrid, runJobs };
   G.LR = API;
   // Web Worker protocol: {cmd: 'init', D, lam, opt} then {cmd: 'run', jobs}; posts {i, err} per run
   if (typeof WorkerGlobalScope !== 'undefined' && G instanceof WorkerGlobalScope) {

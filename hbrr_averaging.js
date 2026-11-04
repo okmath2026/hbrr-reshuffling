@@ -1,13 +1,16 @@
 // Section "Control: averaging the RR iterates": RR with an exponential moving average of its output,
-// y+ = b y + (1 - b) x+, compared with HBRR. Exact computations (no sampling).
+// y+ = b y + (1 - b) x+, compared with HBRR, and HBRR whose iterates are averaged in the same way (Section 6.9).
+// Exact computations (no sampling).
 // Runs in a browser or in Node.js; exports into the global object G.
 (function (G) {
   // ---------- common Hessian (instance of Table 1): exact Tbar from Theorem 3.3 ----------
   // n = 6, A = diag(1, 1/kappa), sigma_l^2 = (0.95, 0.56), e0 = (-1, -1), eps = 2e-4.
-  // method 'hb': heavy ball (alpha, b = beta); method 'ema': RR with step alpha and output EMA weight 1 - b.
-  function tbarCommon(method, alpha, b, kappa, maxEp) {
+  // method 'hb': heavy ball (alpha, b = beta); method 'ema': RR with step alpha and output EMA weight 1 - b;
+  // method 'hbema': heavy ball (alpha, b = beta) with output y+ = c y + (1 - c) x+ (c = 0 gives 'hb', b = 0 gives 'ema').
+  function tbarCommon(method, alpha, b, kappa, maxEp, c) {
     const n = 6, as = [1, 1 / kappa], sig = [0.95, 0.56], eps = 2e-4;
     const st = as.map((a, l) => method === 'hb' ? { a, sg: sig[l], h: 1, hp: 0, s0: -1, s1: -1, N: 0 }
+      : method === 'hbema' ? { a, sg: sig[l], h: 1, hp: 0, s0: -1, s1: -1, f: 1 - c, y: -1, N: 0 }
       : { a, q: 1 - alpha * a, sg: sig[l], f: 1 - b, qm: 1, x: -1, y: -1, N: 0 });
     let last = -1;
     for (let t = 0; t < maxEp; t++) {
@@ -18,6 +21,11 @@
           err += S.s0 * S.s0 + S.N; const p = 1 + b - alpha * S.a;
           for (let j = 0; j < n; j++) { blk.push(S.h); sum += S.h; const hn = p * S.h - b * S.hp; S.hp = S.h; S.h = hn; const sn = p * S.s0 - b * S.s1; S.s1 = S.s0; S.s0 = sn; }
           amp += Math.abs(S.h) + Math.abs(S.hp) + Math.abs(S.s0);
+        } else if (method === 'hbema') { // noise response of the output: f_m = c f_{m-1} + (1 - c) h_m, f_0 = 1 - c
+          err += S.y * S.y + S.N; const p = 1 + b - alpha * S.a;
+          for (let j = 0; j < n; j++) { blk.push(S.f); sum += S.f; const hn = p * S.h - b * S.hp; S.hp = S.h; S.h = hn; S.f = c * S.f + (1 - c) * hn;
+            const sn = p * S.s0 - b * S.s1; S.s1 = S.s0; S.s0 = sn; S.y = c * S.y + (1 - c) * sn; }
+          amp += Math.abs(S.h) + Math.abs(S.hp) + Math.abs(S.s0) + Math.abs(S.f) + Math.abs(S.y);
         } else { // noise response of the averaged output: f_m = b f_{m-1} + (1 - b) q^m, f_0 = 1 - b
           err += S.y * S.y + S.N;
           for (let j = 0; j < n; j++) { blk.push(S.f); sum += S.f; S.qm *= S.q; S.f = b * S.f + (1 - b) * S.qm; S.x *= S.q; S.y = b * S.y + (1 - b) * S.x; }
@@ -49,6 +57,29 @@
       if (bv < gb.T) gb = { T: bv, u, w };
     }
     gb.Tlong = tbarCommon('ema', 10 ** gb.u, 1 - 10 ** gb.w, kappa, 4000000); gb.alpha = 10 ** gb.u; gb.oneMinusB = 10 ** gb.w;
+    return gb;
+  }
+  // tune HBRR with averaged iterates over (u, v, w) = log10 of (alpha, 1 - beta, 1 - c): 13 x 11 x 10 grid over
+  // u in [-5.5, 0.2], v in [-5, 0], w in [-5.5, -1] (v = 0 is averaged RR), pattern searches from the 5 best points
+  // and from the given starts (e.g. the tuned HBRR and averaged RR with a long output memory)
+  function tuneCommonHBEMA(kappa, starts) {
+    let best = Infinity; const cache = new Map();
+    const f = (u, v, w) => {
+      u = Math.min(u, Math.log10(1.98)); v = Math.min(0, v); w = Math.min(0, w); const k = u.toFixed(4) + ',' + v.toFixed(4) + ',' + w.toFixed(4); if (cache.has(k)) return cache.get(k);
+      const T = tbarCommon('hbema', 10 ** u, 1 - 10 ** v, kappa, best === Infinity ? 600000 : Math.ceil(1.5 * best) + 10, 1 - 10 ** w); if (T < best) best = T;
+      const e = { u, v, w, T }; cache.set(k, e); return e;
+    };
+    for (let i = 0; i <= 12; i++) for (let j = 0; j <= 10; j++) for (let k = 0; k <= 9; k++) f(-5.5 + 5.7 * i / 12, -5 + 5 * j / 10, -5.5 + 4.5 * k / 9);
+    const dirs = []; for (const a of [-1, 0, 1]) for (const b of [-1, 0, 1]) for (const c of [-1, 0, 1]) if (a || b || c) dirs.push([a, b, c]);
+    const st = [...cache.values()].filter(e => e.T < Infinity).sort((a, b) => a.T - b.T).slice(0, 5).concat((starts || []).map(s => f(s[0], s[1], s[2])));
+    let gb = { T: Infinity };
+    for (const s of st) {
+      let { u, v, w } = s, bv = s.T, h = 0.1;
+      while (h > 0.002) { let mv = false; for (const [a, b, c] of dirs) { const e = f(u + a * h, v + b * h, w + c * h); if (e.T < bv) { bv = e.T; u = e.u; v = e.v; w = e.w; mv = true; } } if (!mv) h /= 2; }
+      if (bv < gb.T) gb = { T: bv, u, v, w };
+    }
+    gb.alpha = 10 ** gb.u; gb.oneMinusBeta = 10 ** gb.v; gb.oneMinusC = 10 ** gb.w;
+    gb.Tlong = tbarCommon('hbema', gb.alpha, 1 - gb.oneMinusBeta, kappa, 4000000, 1 - gb.oneMinusC);
     return gb;
   }
 
@@ -89,28 +120,39 @@
     }
     return { Ms, cs };
   }
-  // exact epoch moments over all n! permutations
+  // HBRR with averaged iterates: w = (e, e_prev, y) on R^6, y+ = c y + (1 - c) e+; the error is the block (4, 5)
+  function mapsHBEMA(I, alpha, b, c) {
+    const Ms = [], cs = [];
+    for (let i = 0; i < I.n; i++) {
+      const A = I.A[i], g = grad0(I, i), M = new Float64Array(36);
+      M[0] = 1 + b - alpha * A[0]; M[1] = -alpha * A[1]; M[6] = -alpha * A[2]; M[7] = 1 + b - alpha * A[3]; M[2] = -b; M[9] = -b; M[12] = 1; M[19] = 1;
+      for (let q = 0; q < 4; q++) { M[24 + q] = (1 - c) * M[q]; M[30 + q] = (1 - c) * M[6 + q]; } M[28] = c; M[35] = c;
+      Ms.push(M); cs.push([-alpha * g[0], -alpha * g[1], 0, 0, -(1 - c) * alpha * g[0], -(1 - c) * alpha * g[1]]);
+    }
+    return { Ms, cs };
+  }
+  // exact epoch moments over all n! permutations; the state dimension d is that of the maps (4 or 6)
   function moments(Ms, cs, n) {
-    const T = new Float64Array(256), K = new Float64Array(64), Q = new Float64Array(16), EP = new Float64Array(16), Er = new Float64Array(4), used = new Uint8Array(n); let cnt = 0;
+    const d = cs[0].length, d2 = d * d, T = new Float64Array(d2 * d2), K = new Float64Array(d2 * d), Q = new Float64Array(d2), EP = new Float64Array(d2), Er = new Float64Array(d), used = new Uint8Array(n); let cnt = 0;
     function rec(k, P, r) {
       if (k === n) {
         cnt++;
-        for (let i = 0; i < 4; i++) for (let kk = 0; kk < 4; kk++) { const Pik = P[i * 4 + kk]; if (Pik === 0) continue;
-          for (let j = 0; j < 4; j++) { const base = (i * 4 + j) * 16 + kk * 4; for (let l = 0; l < 4; l++) T[base + l] += Pik * P[j * 4 + l]; K[(i * 4 + j) * 4 + kk] += Pik * r[j]; } }
-        for (let i = 0; i < 4; i++) { Er[i] += r[i]; for (let j = 0; j < 4; j++) { Q[i * 4 + j] += r[i] * r[j]; EP[i * 4 + j] += P[i * 4 + j]; } }
+        for (let i = 0; i < d; i++) for (let kk = 0; kk < d; kk++) { const Pik = P[i * d + kk]; if (Pik === 0) continue;
+          for (let j = 0; j < d; j++) { const base = (i * d + j) * d2 + kk * d; for (let l = 0; l < d; l++) T[base + l] += Pik * P[j * d + l]; K[(i * d + j) * d + kk] += Pik * r[j]; } }
+        for (let i = 0; i < d; i++) { Er[i] += r[i]; for (let j = 0; j < d; j++) { Q[i * d + j] += r[i] * r[j]; EP[i * d + j] += P[i * d + j]; } }
         return;
       }
       for (let i = 0; i < n; i++) {
         if (used[i]) continue; used[i] = 1;
-        const M = Ms[i], c = cs[i], P1 = new Float64Array(16), r1 = new Float64Array(4);
-        for (let p = 0; p < 4; p++) { for (let q = 0; q < 4; q++) { let s = 0; for (let t = 0; t < 4; t++) s += M[p * 4 + t] * P[t * 4 + q]; P1[p * 4 + q] = s; }
-          let s = c[p]; for (let t = 0; t < 4; t++) s += M[p * 4 + t] * r[t]; r1[p] = s; }
+        const M = Ms[i], c = cs[i], P1 = new Float64Array(d2), r1 = new Float64Array(d);
+        for (let p = 0; p < d; p++) { for (let q = 0; q < d; q++) { let s = 0; for (let t = 0; t < d; t++) s += M[p * d + t] * P[t * d + q]; P1[p * d + q] = s; }
+          let s = c[p]; for (let t = 0; t < d; t++) s += M[p * d + t] * r[t]; r1[p] = s; }
         rec(k + 1, P1, r1); used[i] = 0;
       }
     }
-    const P0 = new Float64Array(16); for (let i = 0; i < 4; i++) P0[i * 4 + i] = 1; rec(0, P0, new Float64Array(4));
+    const P0 = new Float64Array(d2); for (let i = 0; i < d; i++) P0[i * d + i] = 1; rec(0, P0, new Float64Array(d));
     for (const a of [T, K, Q, EP, Er]) for (let i = 0; i < a.length; i++) a[i] /= cnt;
-    return { T, K, Q, EP, Er };
+    return { T, K, Q, EP, Er, d };
   }
   function solve(A, b, N) {
     const M = Float64Array.from(A), x = Float64Array.from(b);
@@ -122,35 +164,59 @@
     for (let r = N - 1; r >= 0; r--) { let s = x[r]; for (let j = r + 1; j < N; j++) s -= M[r * N + j] * x[j]; x[r] = s / M[r * N + r]; }
     return x;
   }
-  const stationaryMean = mo => { const C = new Float64Array(16); for (let i = 0; i < 16; i++) C[i] = -mo.EP[i]; for (let i = 0; i < 4; i++) C[i * 4 + i] += 1; return solve(C, mo.Er, 4); };
+  const stationaryMean = mo => { const d = mo.d, C = new Float64Array(d * d); for (let i = 0; i < d * d; i++) C[i] = -mo.EP[i]; for (let i = 0; i < d; i++) C[i * d + i] += 1; return solve(C, mo.Er, d); };
   // stationary error of the block (o, o+1); Infinity if not mean-square stable
   function errInf(mo, o) {
-    const B = new Float64Array(256); for (let i = 0; i < 256; i++) B[i] = -mo.T[i]; for (let i = 0; i < 16; i++) B[i * 16 + i] += 1;
-    const eye = new Float64Array(16); for (let i = 0; i < 4; i++) eye[i * 4 + i] = 1;
-    const X = solve(B, eye, 16), A = new Float64Array(16); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) A[i * 4 + j] = (X[i * 4 + j] + X[j * 4 + i]) / 2;
-    for (let j = 0; j < 4; j++) { let s = A[j * 4 + j]; for (let k = 0; k < j; k++) s -= A[j * 4 + k] ** 2; if (!(s > 0)) return Infinity; const l = Math.sqrt(s); A[j * 4 + j] = l;
-      for (let i = j + 1; i < 4; i++) { let t = A[i * 4 + j]; for (let k = 0; k < j; k++) t -= A[i * 4 + k] * A[j * 4 + k]; A[i * 4 + j] = t / l; } }
-    const m = stationaryMean(mo), h = new Float64Array(16);
-    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = mo.Q[i * 4 + j]; for (let k = 0; k < 4; k++) s += (mo.K[(i * 4 + j) * 4 + k] + mo.K[(j * 4 + i) * 4 + k]) * m[k]; h[i * 4 + j] = s; }
-    const S = solve(B, h, 16), v = S[o * 4 + o] + S[(o + 1) * 4 + o + 1];
+    const d = mo.d, d2 = d * d, B = new Float64Array(d2 * d2); for (let i = 0; i < d2 * d2; i++) B[i] = -mo.T[i]; for (let i = 0; i < d2; i++) B[i * d2 + i] += 1;
+    const eye = new Float64Array(d2); for (let i = 0; i < d; i++) eye[i * d + i] = 1;
+    const X = solve(B, eye, d2), A = new Float64Array(d2); for (let i = 0; i < d; i++) for (let j = 0; j < d; j++) A[i * d + j] = (X[i * d + j] + X[j * d + i]) / 2;
+    for (let j = 0; j < d; j++) { let s = A[j * d + j]; for (let k = 0; k < j; k++) s -= A[j * d + k] ** 2; if (!(s > 0)) return Infinity; const l = Math.sqrt(s); A[j * d + j] = l;
+      for (let i = j + 1; i < d; i++) { let t = A[i * d + j]; for (let k = 0; k < j; k++) t -= A[i * d + k] * A[j * d + k]; A[i * d + j] = t / l; } }
+    const m = stationaryMean(mo), h = new Float64Array(d2);
+    for (let i = 0; i < d; i++) for (let j = 0; j < d; j++) { let s = mo.Q[i * d + j]; for (let k = 0; k < d; k++) s += (mo.K[(i * d + j) * d + k] + mo.K[(j * d + i) * d + k]) * m[k]; h[i * d + j] = s; }
+    const S = solve(B, h, d2), v = S[o * d + o] + S[(o + 1) * d + o + 1];
     return isFinite(v) && v >= 0 ? v : Infinity;
   }
   const bias2 = (mo, o) => { const m = stationaryMean(mo); return m[o] ** 2 + m[o + 1] ** 2; };
   // first epoch from which the exact error of block o stays <= eps (checked for 3 last + 2000 epochs)
   function tbar(I, mo, eps, cap, o) {
-    let S = new Float64Array(16), m = new Float64Array(4); const w0 = [-I.xs[0], -I.xs[1], -I.xs[0], -I.xs[1]];
-    for (let i = 0; i < 4; i++) { m[i] = w0[i]; for (let j = 0; j < 4; j++) S[i * 4 + j] = w0[i] * w0[j]; }
+    const d = mo.d, d2 = d * d; let S = new Float64Array(d2), m = new Float64Array(d); const w0 = Array.from({ length: d }, (_, i) => -I.xs[i % 2]);
+    for (let i = 0; i < d; i++) { m[i] = w0[i]; for (let j = 0; j < d; j++) S[i * d + j] = w0[i] * w0[j]; }
     let last = -1;
     for (let t = 0; t < cap; t++) {
-      const err = S[o * 4 + o] + S[(o + 1) * 4 + o + 1]; if (!(err < 1e30)) return Infinity;
+      const err = S[o * d + o] + S[(o + 1) * d + o + 1]; if (!(err < 1e30)) return Infinity;
       if (err > eps) last = t; else if (t > 3 * last + 2000) return last + 1;
-      const S1 = new Float64Array(16), m1 = new Float64Array(4);
-      for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = mo.Q[i * 4 + j]; for (let k = 0; k < 4; k++) s += (mo.K[(i * 4 + j) * 4 + k] + mo.K[(j * 4 + i) * 4 + k]) * m[k];
-        const base = (i * 4 + j) * 16; for (let a = 0; a < 16; a++) s += mo.T[base + a] * S[a]; S1[i * 4 + j] = s; }
-      for (let i = 0; i < 4; i++) { let s = mo.Er[i]; for (let k = 0; k < 4; k++) s += mo.EP[i * 4 + k] * m[k]; m1[i] = s; }
+      const S1 = new Float64Array(d2), m1 = new Float64Array(d);
+      for (let i = 0; i < d; i++) for (let j = 0; j < d; j++) { let s = mo.Q[i * d + j]; for (let k = 0; k < d; k++) s += (mo.K[(i * d + j) * d + k] + mo.K[(j * d + i) * d + k]) * m[k];
+        const base = (i * d + j) * d2; for (let a = 0; a < d2; a++) s += mo.T[base + a] * S[a]; S1[i * d + j] = s; }
+      for (let i = 0; i < d; i++) { let s = mo.Er[i]; for (let k = 0; k < d; k++) s += mo.EP[i * d + k] * m[k]; m1[i] = s; }
       S = S1; m = m1;
     }
     return Infinity;
+  }
+  // tuned T(eps) on one heterogeneous instance by pattern search in log10 of the parameters, from the given starts:
+  //  'rr' [u], 'ema' [u, w], 'hb' [u, v], 'hbema' [u, v, w], with alpha = 10^u, 1 - beta = 10^v, 1 - (output weight) = 10^w
+  function tuneHet(I, method, starts, eps, cap) {
+    const n = I.n, cache = new Map(); let best = Infinity;
+    const maps = p => method === 'rr' ? mapsEMA(I, 10 ** p[0], 0) : method === 'ema' ? mapsEMA(I, 10 ** p[0], 1 - 10 ** p[1])
+      : method === 'hb' ? mapsHB(I, 10 ** p[0], 1 - 10 ** p[1]) : mapsHBEMA(I, 10 ** p[0], 1 - 10 ** p[1], 1 - 10 ** p[2]);
+    const o = method === 'hb' ? 0 : method === 'hbema' ? 4 : 2;
+    const f = p => {
+      p = p.map((x, i) => i ? Math.min(0, x) : x); const k = p.map(x => x.toFixed(4)).join(','); if (cache.has(k)) return cache.get(k);
+      // tbar certifies T only after 3 T + 2000 epochs, so the cap for T <= 1.5 best is 4.5 best + 2010
+      const mm = maps(p), T = tbar(I, moments(mm.Ms, mm.cs, n), eps, best === Infinity ? cap : Math.min(cap, Math.ceil(4.5 * best) + 2010), o); if (T < best) best = T;
+      const e = { p, T }; cache.set(k, e); return e;
+    };
+    const dim = starts[0].length, dirs = [];
+    (function gen(v) { if (v.length === dim) { if (v.some(x => x)) dirs.push(v); return; } for (const s of [-1, 0, 1]) gen(v.concat(s)); })([]);
+    let gb = { T: Infinity };
+    for (const s of starts) {
+      let e0 = f(s), p = e0.p, bv = e0.T, h = 0.2;
+      while (h > 0.004) { let mv = false; for (const dv of dirs) { const e = f(p.map((x, i) => x + dv[i] * h)); if (e.T < bv) { bv = e.T; p = e.p; mv = true; } } if (!mv) h /= 2; }
+      if (bv < gb.T) gb = { T: bv, p };
+    }
+    gb.evals = cache.size;
+    return gb;
   }
   // RR step at which the RR stationary error equals 1e-6 |x*|^2; then the stationary errors of averaged RR and of HBRR
   // (same effective step, 1 - beta = w), relative to RR, and the bias share of the RR error
@@ -165,6 +231,20 @@
     }
     return out;
   }
-  Object.assign(G, { avgTbarCommon: tbarCommon, avgTuneCommon: tuneCommonEMA, avgMakeInstance: makeInstance, avgMapsEMA: mapsEMA, avgMapsHB: mapsHB,
-    avgMoments: moments, avgErrInf: errInf, avgTbar: tbar, avgFloorStudy: floorStudy });
+  // as floorStudy, for HBRR with averaged iterates: stationary errors relative to RR of HBRR (effective step = RR step,
+  // 1 - beta = w) and of HBRR with output weight 1 - c = w (same memory) and w / 10 (ten times longer), w in {0.01, 0.001}
+  function floorStudyCombined(n, kappa, seed) {
+    const I = makeInstance(n, kappa, seed), target = 1e-6 * I.E0;
+    const rr = a => { const mm = mapsEMA(I, a, 0); return moments(mm.Ms, mm.cs, n); };
+    let lo = -6, hi = Math.log10(1.9); for (let it = 0; it < 40; it++) { const mid = (lo + hi) / 2; if (errInf(rr(10 ** mid), 2) < target) lo = mid; else hi = mid; }
+    const a = 10 ** lo, mo = rr(a), F = errInf(mo, 2), out = { n, kappa: I.kappa, nAlpha: n * a, biasShare: bias2(mo, 2) / F };
+    for (const w of [0.01, 0.001]) {
+      const e = mapsEMA(I, a, 1 - w), h = mapsHB(I, a * w, 1 - w), c1 = mapsHBEMA(I, a * w, 1 - w, 1 - w), c2 = mapsHBEMA(I, a * w, 1 - w, 1 - w / 10);
+      out['avg' + w] = errInf(moments(e.Ms, e.cs, n), 2) / F; out['hb' + w] = errInf(moments(h.Ms, h.cs, n), 0) / F;
+      out['hbe' + w] = errInf(moments(c1.Ms, c1.cs, n), 4) / F; out['hbe10_' + w] = errInf(moments(c2.Ms, c2.cs, n), 4) / F;
+    }
+    return out;
+  }
+  Object.assign(G, { avgTbarCommon: tbarCommon, avgTuneCommon: tuneCommonEMA, avgTuneCommonHBEMA: tuneCommonHBEMA, avgMakeInstance: makeInstance, avgMapsEMA: mapsEMA, avgMapsHB: mapsHB,
+    avgMapsHBEMA: mapsHBEMA, avgMoments: moments, avgErrInf: errInf, avgTbar: tbar, avgTuneHet: tuneHet, avgFloorStudy: floorStudy, avgFloorStudyCombined: floorStudyCombined });
 })(typeof window !== 'undefined' ? window : globalThis);
