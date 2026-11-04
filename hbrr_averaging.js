@@ -266,6 +266,34 @@
     for (const s of starts) { let u = s, bv = f(u); for (let h = 0.2; h > 0.004; h /= 2) { let mv = true; while (mv) { mv = false; for (const d of [-h, h]) { const T = f(u + d); if (T < bv) { bv = T; u += d; mv = true; } } } } if (bv < gb.T) gb = { T: bv, u }; }
     return { n, kappa: I.kappa, fac, T: gb.T, alpha: 10 ** gb.u };
   }
-  Object.assign(G, { avgRuleCommon: ruleCommon, avgRuleHet: ruleHet, avgTbarCommon: tbarCommon, avgTuneCommon: tuneCommonEMA, avgTuneCommonHBEMA: tuneCommonHBEMA, avgMakeInstance: makeInstance, avgMapsEMA: mapsEMA, avgMapsHB: mapsHB,
+  // limit kappa -> infinity of the common-Hessian formula (Section 6.9, "The rule in the limit"), in the time t = sqrt(alpha mu) x steps:
+  // slow coordinate s'' + sqrt(r) s' + s = 0 (s(0) = 1, s'(0) = 0), impulse response g (g(0) = 0, g'(0) = 1), output average
+  // Y' = k (s - Y), F' = k (g - F), k = q sqrt(r). Error / eps = (Y^2 + rhoE e^{-2kt}) / eta + lam int_0^t F'^2 for HBRR with averaged
+  // iterates (hb = false), and (s^2 + rhoE e^{-sqrt(r) t}) / eta + lam (int_0^t g'^2 + rho (1 - e^{-sqrt(r) t}) / (2 sqrt(r))) for HBRR,
+  // with eta = eps / e_mu^2, rhoE = sum of the stiff e_l^2 / e_mu^2, rho = sum of the stiff sigma_l^2 / sigma_mu^2 and
+  // lam = (alpha mu)^{3/2} n (n + 1) sigma_mu^2 / (12 mu^2 eps). Returns the last t with error > eps (Infinity if the floor exceeds eps);
+  // the epoch count is t lam^{-1/3} (n (n + 1) sigma_mu^2 / (12 mu^2 eps))^{1/3} / n.
+  function limitT(r, q, lam, eta, hb, rho, rhoE, dt = 0.01) {
+    const sr = Math.sqrt(r), k = q * sr, tmax = 60 / Math.min(sr / 2, hb ? Infinity : k) + 5;
+    let x = [1, 0, 0, 1, 1, 0, 0], t = 0, last = 0; // s, s', g, g', Y, F, Phi
+    const der = x => { const Fp = k * (x[2] - x[5]); return [x[1], -sr * x[1] - x[0], x[3], -sr * x[3] - x[2], hb ? 0 : k * (x[0] - x[4]), hb ? 0 : Fp, hb ? x[3] * x[3] : Fp * Fp]; };
+    while (t < tmax) {
+      const er = hb ? (x[0] * x[0] + rhoE * Math.exp(-sr * t)) / eta + lam * (x[6] + rho * (1 - Math.exp(-sr * t)) / (2 * sr))
+        : (x[4] * x[4] + rhoE * Math.exp(-2 * k * t)) / eta + lam * x[6];
+      if (er > 1) last = t;
+      const k1 = der(x), k2 = der(x.map((v, i) => v + dt / 2 * k1[i])), k3 = der(x.map((v, i) => v + dt / 2 * k2[i])), k4 = der(x.map((v, i) => v + dt * k3[i]));
+      x = x.map((v, i) => v + dt / 6 * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i])); t += dt;
+    }
+    const fin = hb ? lam * (x[6] + rho / (2 * sr)) : lam * x[6];
+    return fin >= 1 ? Infinity : last;
+  }
+  // minimum over (r, q, log10 lam) on a grid of J = t lam^{-1/3}; the paper used r in 1.4..3.8 (step 0.2), q in 0.4..1.2 (step 0.1),
+  // log10 lam in 0..2 (step 0.1) for the sweep and finer grids (0.1, 0.05, 0.05) for the instance of Table 1, dt = 0.02
+  function limitOpt(eta, hb, rho, rhoE, rs, qs, lls, dt = 0.02) {
+    let best = { J: Infinity };
+    for (const r of rs) for (const q of hb ? [1] : qs) for (const ll of lls) { const J = limitT(r, q, 10 ** ll, eta, hb, rho, rhoE, dt) * 10 ** (-ll / 3); if (J < best.J) best = { J, r, q, ll }; }
+    return best;
+  }
+  Object.assign(G, { avgLimitT: limitT, avgLimitOpt: limitOpt, avgRuleCommon: ruleCommon, avgRuleHet: ruleHet, avgTbarCommon: tbarCommon, avgTuneCommon: tuneCommonEMA, avgTuneCommonHBEMA: tuneCommonHBEMA, avgMakeInstance: makeInstance, avgMapsEMA: mapsEMA, avgMapsHB: mapsHB,
     avgMapsHBEMA: mapsHBEMA, avgMoments: moments, avgErrInf: errInf, avgTbar: tbar, avgTuneHet: tuneHet, avgFloorStudy: floorStudy, avgFloorStudyCombined: floorStudyCombined });
 })(typeof window !== 'undefined' ? window : globalThis);
