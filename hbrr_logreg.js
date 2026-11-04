@@ -156,7 +156,8 @@
   // 'attr:lo:hi': natural split by a categorical attribute, one-hot coded in features lo..hi (0-based, see onehotGroups):
   // one block per value (samples with none of these features form one more block), nb is ignored. The blocks then have
   // different sizes n_k, and the components are f_k = (nb n_k / n) * (average loss of block k), so that their mean is f.
-  // Equal-size modes use the block averages (weights differ from nb n_k / n only by rounding of the block sizes).
+  // The equal-size modes use the same weights: when nb does not divide n the block sizes differ by one, and plain block
+  // averages would change the objective (and break sum_k grad f_k(x*) = 0).
   const partCache = new WeakMap();
   function partition(D, mode, nb) {
     if (!partCache.has(D)) partCache.set(D, new Map());
@@ -185,7 +186,7 @@
       const proj = new Float64Array(n); for (let i = 0; i < n; i++) { let s = 0; for (let k = D.ptr[i]; k < D.ptr[i + 1]; k++) s += D.val[k] * v[D.idx[k]]; proj[i] = s; }
       const o = Array.from(ord); o.sort((i, j) => proj[i] - proj[j]); ord.set(o);
     }
-    const lo = Int32Array.from({ length: nb + 1 }, (_, k) => Math.round(k * n / nb)), P = { ord, lo };
+    const lo = Int32Array.from({ length: nb + 1 }, (_, k) => Math.round(k * n / nb)), P = { ord, lo, nb, scale: nb / n };
     cache.set(key, P); return P;
   }
   // one-hot coded categorical attributes: maximal runs [lo, hi] of consecutive 0/1 features such that no sample has two
